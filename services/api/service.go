@@ -41,9 +41,11 @@ import (
 )
 
 const (
-	ErrBlockAlreadyKnown  = "simulation failed: block already known"
-	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
-	ErrMissingTrieNode    = "missing trie node"
+	RelayActualGasLimit     = 30_000_000
+	RelayFictitiousGasLimit = 100_000_000
+	ErrBlockAlreadyKnown    = "simulation failed: block already known"
+	ErrBlockRequiresReorg   = "simulation failed: block requires a reorg"
+	ErrMissingTrieNode      = "missing trie node"
 )
 
 var (
@@ -158,6 +160,7 @@ type blockSimResult struct {
 	optimisticSubmission bool
 	requestErr           error
 	validationErr        error
+	overrides			 *common.BuilderBlockValidationResponseV2
 }
 
 // RelayAPI represents a single Relay instance
@@ -548,9 +551,10 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 }
 
 // simulateBlock sends a request for a block simulation to blockSimRateLimiter.
-func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (requestErr, validationErr error) {
+func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (overrides *common.BuilderBlockValidationResponseV2, requestErr, validationErr error) {
 	t := time.Now()
-	requestErr, validationErr = api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
+	overrides, requestErr, validationErr = api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
+
 	log := opts.log.WithFields(logrus.Fields{
 		"durationMs": time.Since(t).Milliseconds(),
 		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
@@ -561,18 +565,18 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (r
 			ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
-				return nil, nil
+				return nil, nil, nil
 			}
 		}
 		log.WithError(validationErr).Warn("block validation failed")
-		return nil, validationErr
+		return nil, nil, validationErr
 	}
 	if requestErr != nil {
 		log.WithError(requestErr).Warn("block validation failed: request error")
-		return requestErr, nil
+		return nil, requestErr, nil
 	}
 	log.Info("block validation successful")
-	return nil, nil
+	return overrides, nil, nil
 }
 
 func (api *RelayAPI) demoteBuilder(pubkey string, req *common.BuilderSubmitBlockRequest, simError error) {
@@ -618,8 +622,14 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		// it for logging, it is not atomic to avoid the performance impact.
 		"optBlocksInFlight": api.optimisticBlocksInFlight,
 	}).Infof("simulating optimistic block with hash: %v", opts.req.BuilderSubmitBlockRequest.BlockHash())
-	reqErr, simErr := api.simulateBlock(ctx, opts)
-	simResultC <- &blockSimResult{reqErr == nil, true, reqErr, simErr}
+	overrides, reqErr, simErr := api.simulateBlock(ctx, opts)
+
+	overrideGasValues(
+		&opts.req.BuilderSubmitBlockRequest,
+		overrides,
+	)
+
+	simResultC <- &blockSimResult{reqErr == nil, true, reqErr, simErr, overrides}
 	if reqErr != nil || simErr != nil {
 		// Mark builder as non-optimistic.
 		opts.builder.status.IsOptimistic = false
@@ -750,6 +760,12 @@ func (api *RelayAPI) updateProposerDuties(headSlot uint64) {
 	if err != nil {
 		api.log.WithError(err).Error("failed getting proposer duties from redis")
 		return
+	}
+
+	// Changes the response to indicate that the target gas limit is
+	// RelayActualGasLimit, not the proposer-specified value.
+	for _, duty := range duties {
+		duty.Entry.Message.GasLimit = RelayActualGasLimit
 	}
 
 	// Prepare raw bytes for HTTP response
@@ -1484,23 +1500,23 @@ func (api *RelayAPI) handleBuilderGetValidators(w http.ResponseWriter, req *http
 	}
 }
 
-func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, payload *common.BuilderSubmitBlockRequest) (uint64, bool) {
+func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, payload *common.BuilderSubmitBlockRequest) bool {
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[payload.Slot()]
 	api.proposerDutiesLock.RUnlock()
 	if slotDuty == nil {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
-		return 0, false
+		return false
 	} else if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), payload.ProposerFeeRecipient()) {
 		log.WithFields(logrus.Fields{
 			"expectedFeeRecipient": slotDuty.Entry.Message.FeeRecipient.String(),
 			"actualFeeRecipient":   payload.ProposerFeeRecipient(),
 		}).Info("fee recipient does not match")
 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-		return 0, false
+		return false
 	}
-	return slotDuty.Entry.Message.GasLimit, true
+	return true
 }
 
 func (api *RelayAPI) checkSubmissionPayloadAttrs(w http.ResponseWriter, log *logrus.Entry, payload *common.BuilderSubmitBlockRequest) bool {
@@ -1630,7 +1646,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	isBidBelowFloor := floorBidValue != nil && opts.payload.Value().Cmp(floorBidValue) == -1
 	isBidAtOrBelowFloor := floorBidValue != nil && opts.payload.Value().Cmp(floorBidValue) < 1
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
-		opts.simResultC <- &blockSimResult{false, false, nil, nil}
+		opts.simResultC <- &blockSimResult{false, false, nil, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
 		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.payload.Slot(), opts.payload.ParentHash(), opts.payload.ProposerPubkey(), opts.payload.BuilderPubkey().String())
 		if err != nil {
@@ -1641,7 +1657,7 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 		api.Respond(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
 		return nil, false
 	} else if !opts.cancellationsEnabled && isBidAtOrBelowFloor { // without cancellations: if at or below floor -> ignore
-		opts.simResultC <- &blockSimResult{false, false, nil, nil}
+		opts.simResultC <- &blockSimResult{false, false, nil, nil, nil}
 		opts.log.Info("submission at or below floor bid value, without cancellation")
 		api.RespondMsg(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
 		return nil, false
@@ -1817,7 +1833,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"timestampAfterChecks1": time.Now().UTC().UnixMilli(),
 	})
 
-	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, payload)
+	ok = api.checkSubmissionFeeRecipient(w, log, payload)
 	if !ok {
 		return
 	}
@@ -1887,8 +1903,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		case simResult = <-simResultC:
 		case <-time.After(10 * time.Second):
 			log.Warn("timed out waiting for simulation result")
-			simResult = &blockSimResult{false, false, nil, nil}
+			simResult = &blockSimResult{false, false, nil, nil, nil}
 		}
+
+		// override the gas values with the ones from the simulation
+		overrideGasValues(payload, simResult.overrides)
 
 		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission)
 		if err != nil {
@@ -1940,7 +1959,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		builder:    builderEntry,
 		req: &common.BuilderBlockValidationRequest{
 			BuilderSubmitBlockRequest: *payload,
-			RegisteredGasLimit:        gasLimit,
+			RegisteredGasLimit:        RelayFictitiousGasLimit,
 		},
 	}
 	// With sufficient collateral, process the block optimistically.
@@ -1950,8 +1969,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		go api.processOptimisticBlock(opts, simResultC)
 	} else {
 		// Simulate block (synchronously).
-		requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
-		simResultC <- &blockSimResult{requestErr == nil, false, requestErr, validationErr}
+		overrides, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+
+		overrideGasValues(
+			&opts.req.BuilderSubmitBlockRequest,
+			overrides,
+		)
+
+		simResultC <- &blockSimResult{requestErr == nil, false, requestErr, validationErr, overrides}
 		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
 		log = log.WithFields(logrus.Fields{
 			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
@@ -2359,5 +2384,15 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 		api.RespondMsg(w, http.StatusOK, "ready")
 	} else {
 		api.RespondMsg(w, http.StatusServiceUnavailable, "not ready")
+	}
+}
+
+func overrideGasValues(
+	req *common.BuilderSubmitBlockRequest,
+	overrides *common.BuilderBlockValidationResponseV2,
+) {
+	if overrides != nil && req != nil {
+		req.Capella.ExecutionPayload.BlockHash = overrides.NewBlockHash
+		req.Capella.ExecutionPayload.GasLimit = overrides.NewGasLimit
 	}
 }
